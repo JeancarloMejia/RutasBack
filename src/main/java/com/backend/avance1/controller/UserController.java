@@ -1,0 +1,197 @@
+package com.backend.avance1.controller;
+
+import com.backend.avance1.dto.ApiResponse;
+import com.backend.avance1.dto.UpdateUserDTO;
+import com.backend.avance1.dto.ChangePasswordDTO;
+import com.backend.avance1.entity.User;
+import com.backend.avance1.service.MailService;
+import com.backend.avance1.service.UserService;
+import com.backend.avance1.service.UserExcelService;
+import org.springframework.http.MediaType;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.web.bind.annotation.*;
+
+import java.io.IOException;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/user")
+@RequiredArgsConstructor
+public class UserController {
+
+    private final UserService userService;
+    private final MailService mailService;
+    private final BCryptPasswordEncoder passwordEncoder;
+    private final UserExcelService userExcelService;
+
+    @GetMapping("/profile")
+    public ResponseEntity<ApiResponse> getProfile(@AuthenticationPrincipal User user) {
+        if (user == null) {
+            return ResponseEntity.badRequest()
+                    .body(new ApiResponse(false, "Usuario no autenticado"));
+        }
+        return ResponseEntity.ok(new ApiResponse(true, "Perfil de usuario obtenido", user));
+    }
+
+    @PutMapping("/update")
+    public ResponseEntity<ApiResponse> updateProfile(@AuthenticationPrincipal User user,
+                                                     @Valid @RequestBody UpdateUserDTO updatedUser) {
+        if (user == null) {
+            return ResponseEntity.badRequest()
+                    .body(new ApiResponse(false, "Usuario no autenticado"));
+        }
+        return actualizarUsuario(user, updatedUser);
+    }
+
+    @PutMapping("/change-password")
+    public ResponseEntity<ApiResponse> changePassword(@AuthenticationPrincipal User user,
+                                                      @Valid @RequestBody ChangePasswordDTO dto) {
+        if (user == null) {
+            return ResponseEntity.badRequest()
+                    .body(new ApiResponse(false, "Usuario no autenticado"));
+        }
+
+        if (!passwordEncoder.matches(dto.getOldPassword(), user.getPassword())) {
+            return ResponseEntity.badRequest()
+                    .body(new ApiResponse(false, "La contraseña actual es incorrecta"));
+        }
+
+        userService.actualizarPassword(user, dto.getNewPassword());
+
+        try {
+            mailService.enviarCorreoHtml(
+                    user.getEmail(),
+                    "Tu contraseña ha sido cambiada",
+                    "password-changed.html",
+                    user.getNombres(),
+                    ""
+            );
+        } catch (Exception e) {
+            throw new RuntimeException("Error al enviar correo de cambio de contraseña", e);
+        }
+
+        return ResponseEntity.ok(new ApiResponse(true, "Contraseña cambiada correctamente"));
+    }
+
+    @GetMapping("/clientes")
+    @PreAuthorize("hasAnyRole('ADMIN', 'SUPERADMIN')")
+    public ResponseEntity<ApiResponse> listarClientes() {
+        List<User> clientes = userService.listarClientes();
+        return ResponseEntity.ok(new ApiResponse(true, "Usuarios con rol CLIENTE obtenidos", clientes));
+    }
+
+    @GetMapping("/conductores-clientes")
+    @PreAuthorize("hasAnyRole('ADMIN', 'SUPERADMIN')")
+    public ResponseEntity<ApiResponse> listarConductoresYClientes() {
+        List<User> conductores = userService.listarConductoresYClientes();
+        return ResponseEntity.ok(new ApiResponse(true, "Usuarios con roles CONDUCTOR y CLIENTE obtenidos", conductores));
+    }
+
+    @GetMapping("/admins")
+    @PreAuthorize("hasRole('SUPERADMIN')")
+    public ResponseEntity<ApiResponse> listarAdminsYSuperAdmins() {
+        List<User> admins = userService.listarAdminsYSuperAdmins();
+        return ResponseEntity.ok(new ApiResponse(true, "Usuarios con rol ADMIN o SUPERADMIN obtenidos", admins));
+    }
+
+    @GetMapping("/{id}")
+    @PreAuthorize("hasAnyRole('ADMIN', 'SUPERADMIN')")
+    public ResponseEntity<ApiResponse> obtenerUsuarioPorId(@PathVariable Long id) {
+        return userService.buscarPorId(id)
+                .map(usuario -> ResponseEntity.ok(
+                        new ApiResponse(true, "Usuario encontrado", usuario)
+                ))
+                .orElseGet(() -> ResponseEntity
+                        .badRequest()
+                        .body(new ApiResponse(false, "Usuario no encontrado")));
+    }
+
+    @PutMapping("/update/{id}")
+    @PreAuthorize("hasAnyRole('ADMIN', 'SUPERADMIN')")
+    public ResponseEntity<ApiResponse> actualizarUsuarioPorAdmin(@PathVariable Long id,
+                                                                 @Valid @RequestBody UpdateUserDTO updatedUser) {
+        return userService.buscarPorId(id)
+                .map(usuario -> actualizarUsuario(usuario, updatedUser))
+                .orElseGet(() -> ResponseEntity
+                        .badRequest()
+                        .body(new ApiResponse(false, "Usuario no encontrado")));
+    }
+
+    private ResponseEntity<ApiResponse> actualizarUsuario(User user, UpdateUserDTO updatedUser) {
+        if (!userService.celularDisponibleParaUsuario(updatedUser.getCelular(), user.getId())) {
+            return ResponseEntity.badRequest()
+                    .body(new ApiResponse(false, "El número de celular ya está en uso"));
+        }
+
+        user.setDireccion(updatedUser.getDireccion());
+        user.setCelular(updatedUser.getCelular());
+        User savedUser = userService.actualizarUsuario(user);
+
+        try {
+            mailService.enviarCorreoHtml(
+                    savedUser.getEmail(),
+                    "Actualización de perfil",
+                    "profile-updated.html",
+                    savedUser.getNombres(),
+                    ""
+            );
+        } catch (Exception e) {
+            throw new RuntimeException("Error al enviar correo de actualización de perfil", e);
+        }
+
+        return ResponseEntity.ok(new ApiResponse(true, "Perfil actualizado correctamente", savedUser));
+    }
+
+    @GetMapping("/export/excel")
+    @PreAuthorize("hasAnyRole('ADMIN', 'SUPERADMIN')")
+    public ResponseEntity<byte[]> exportUsersToExcel() {
+        try {
+            byte[] excelData = userExcelService.exportUsersToExcel();
+
+            return ResponseEntity.ok()
+                    .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=usuarios.xlsx")
+                    .contentType(MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                    .body(excelData);
+        } catch (IOException e) {
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    @GetMapping("/clientes/count")
+    @PreAuthorize("hasAnyRole('ADMIN', 'SUPERADMIN')")
+    public ResponseEntity<ApiResponse> contarUsuariosClientes() {
+        long totalClientes = userService.contarUsuariosClientes();
+        return ResponseEntity.ok(new ApiResponse(true, "Total de usuarios con rol CLIENTE", totalClientes));
+    }
+
+    @GetMapping("/clientes-conductores/count")
+    @PreAuthorize("hasAnyRole('ADMIN', 'SUPERADMIN')")
+    public ResponseEntity<ApiResponse> contarUsuariosClientesYConductores() {
+        long totalClientesYConductores = userService.contarUsuariosClientesYConductores();
+        return ResponseEntity.ok(new ApiResponse(true, "Total de usuarios con roles CLIENTE y CONDUCTOR", totalClientesYConductores));
+    }
+
+    @GetMapping("/admins-superadmins/count")
+    @PreAuthorize("hasAnyRole('ADMIN', 'SUPERADMIN')")
+    public ResponseEntity<ApiResponse> contarUsuariosAdminsYSuperAdmins() {
+        long totalAdminsYSuperAdmins = userService.contarUsuariosAdminsYSuperAdmins();
+        return ResponseEntity.ok(new ApiResponse(true, "Total de usuarios con roles ADMIN o SUPERADMIN", totalAdminsYSuperAdmins));
+    }
+
+    @DeleteMapping("/{id}")
+    @PreAuthorize("hasAnyRole('ADMIN', 'SUPERADMIN')")
+    public ResponseEntity<ApiResponse> eliminarUsuario(@PathVariable Long id) {
+        boolean eliminado = userService.eliminarUsuario(id);
+        if (eliminado) {
+            return ResponseEntity.ok(new ApiResponse(true, "Usuario eliminado correctamente"));
+        } else {
+            return ResponseEntity.badRequest().body(new ApiResponse(false, "No se pudo eliminar el usuario"));
+        }
+    }
+}
